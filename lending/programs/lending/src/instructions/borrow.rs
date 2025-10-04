@@ -1,0 +1,152 @@
+use std::f32::consts::E;
+
+use anchor_lang::prelude::*;
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token_interface::{transfer_checked, Mint, TokenAccount, TokenInterface, TransferChecked},
+};
+use pyth_solana_receiver_sdk::price_update::{get_feed_id_from_hex, PriceUpdateV2};
+
+use crate::{
+    constants::{MAX_AGE, SOL_USD_FEED_ID, USDC_USD_FEED_ID},
+    error::LendingError,
+    state::{Bank, User},
+};
+
+#[derive(Accounts)]
+pub struct Borrow<'info> {
+    #[account(mut)]
+    pub signer: Signer<'info>,
+
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [mint.key().as_ref()],
+        bump
+    )]
+    pub bank: Account<'info, Bank>,
+
+    #[account(
+        mut,
+        seeds = [b"treasury", mint.key().as_ref()],
+        bump
+    )]
+    pub bank_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [signer.key().as_ref()],
+        bump
+    )]
+    pub user_account: Account<'info, User>,
+
+    #[account(
+        init_if_needed,
+        payer = signer,
+        associated_token::mint = mint,
+        associated_token::authority = signer,
+        associated_token::token_program = token_program
+    )]
+    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    pub price_update: Account<'info, PriceUpdateV2>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> Borrow<'info> {
+    pub fn borrow_assets(&mut self, amount: u64, bank_token_acc_bumps: u8) -> Result<()> {
+        let bank = &mut self.bank;
+        let user = &mut self.user_account;
+
+        let price_update = &mut self.price_update;
+
+        let total_collateral: u64;
+
+        match self.mint.to_account_info().key() {
+            key if key == user.usdc_address => {
+                let sol_feed_id = get_feed_id_from_hex(SOL_USD_FEED_ID)?;
+                let sol_price =
+                    price_update.get_price_no_older_than(&Clock::get()?, MAX_AGE, &sol_feed_id)?;
+                let new_val = calc_accured_interest(
+                    user.deposited_sol,
+                    bank.interest_rate,
+                    user.last_updated,
+                )?;
+                total_collateral = sol_price.price as u64 * new_val;
+            }
+            _ => {
+                let usdc_feed_id = get_feed_id_from_hex(USDC_USD_FEED_ID)?;
+                let usdc_price =
+                    price_update.get_price_no_older_than(&Clock::get()?, MAX_AGE, &usdc_feed_id)?;
+                let new_val = calc_accured_interest(
+                    user.deposited_usdc,
+                    bank.interest_rate,
+                    user.last_updated,
+                )?;
+                total_collateral = usdc_price.price as u64 * new_val;
+            }
+        }
+
+        let borrowable_amount = total_collateral
+            .checked_mul(bank.liquadation_threshold)
+            .unwrap();
+
+        if borrowable_amount < amount {
+            return Err(LendingError::OverBorrowableAmount.into());
+        }
+
+        let transfer_cpi_program = self.token_program.to_account_info();
+
+        let transfer_cpi_accounts = TransferChecked {
+            from: self.bank_token_account.to_account_info(),
+            mint: self.mint.to_account_info(),
+            to: self.user_token_account.to_account_info(),
+            authority: self.bank_token_account.to_account_info(),
+        };
+
+        let mint_key = self.mint.key();
+        let signer_seeds: &[&[&[u8]]] =
+            &[&[b"treasury", mint_key.as_ref(), &[bank_token_acc_bumps]]];
+
+        let cpi_ctx =
+            CpiContext::new_with_signer(transfer_cpi_program, transfer_cpi_accounts, signer_seeds);
+
+        transfer_checked(cpi_ctx, amount, self.mint.decimals)?;
+
+        if bank.total_borrowed == 0 {
+            bank.total_borrowed = amount;
+            bank.total_borrowed_shares = amount;
+        }
+
+        let borrow_ratio = amount.checked_div(bank.total_borrowed).unwrap();
+        let user_shares = bank
+            .total_borrowed_shares
+            .checked_mul(borrow_ratio)
+            .unwrap();
+
+        match self.mint.to_account_info().key() {
+            key if key == user.usdc_address => {
+                user.borrowed_usdc += amount;
+                user.borrowed_usdc_shares += user_shares;
+            }
+            _ => {
+                user.borrowed_sol += amount;
+                user.borrowed_sol_shares += user_shares;
+            }
+        }
+
+        user.last_updated_borrow = Clock::get()?.unix_timestamp;
+        Ok(())
+    }
+}
+
+fn calc_accured_interest(deposited: u64, interest_rate: u64, last_updated: i64) -> Result<u64> {
+    let current_time = Clock::get()?.unix_timestamp;
+    let time_diff = current_time - last_updated;
+    let new_value =
+        (deposited as f64 * E.powf(interest_rate as f32 * time_diff as f32) as f64) as u64;
+    Ok(new_value)
+}
